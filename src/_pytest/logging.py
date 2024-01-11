@@ -669,15 +669,23 @@ class LoggingPlugin:
                 os.makedirs(directory)
 
         self.log_file_handler = _FileHandler(log_file, mode="w", encoding="UTF-8")
-        log_file_format = get_option_ini(config, "log_file_format", "log_format")
-        log_file_date_format = get_option_ini(
+        self.log_file_format = get_option_ini(config, "log_file_format", "log_format")
+        self.log_file_date_format = get_option_ini(
             config, "log_file_date_format", "log_date_format"
         )
 
-        log_file_formatter = DatetimeFormatter(
-            log_file_format, datefmt=log_file_date_format
+        self.log_file_formatter = DatetimeFormatter(
+            self.log_file_format, datefmt=self.log_file_date_format
         )
-        self.log_file_handler.setFormatter(log_file_formatter)
+
+        log_file = get_option_ini(config, "log_file")
+        if log_file:
+            self.log_file_handler = logging.FileHandler(
+                log_file, mode="w", encoding="UTF-8"
+            )  # type: Optional[logging.FileHandler]
+            self.log_file_handler.setFormatter(self.log_file_formatter)
+        else:
+            self.log_file_handler = None
 
         # CLI/live logging.
         self.log_cli_level = get_log_level_for_setting(
@@ -770,7 +778,10 @@ class LoggingPlugin:
         self.log_cli_handler.set_when("sessionstart")
 
         with catching_logs(self.log_cli_handler, level=self.log_cli_level):
-            with catching_logs(self.log_file_handler, level=self.log_file_level):
+            if self.log_file_handler is not None:
+                with catching_logs(self.log_file_handler, level=self.log_file_level):
+                    return (yield)
+            else:
                 return (yield)
 
     @hookimpl(wrapper=True, tryfirst=True)
@@ -778,8 +789,17 @@ class LoggingPlugin:
         self.log_cli_handler.set_when("collection")
 
         with catching_logs(self.log_cli_handler, level=self.log_cli_level):
-            with catching_logs(self.log_file_handler, level=self.log_file_level):
-                return (yield)
+            if self.log_file_handler is not None:
+                with catching_logs(self.log_file_handler, level=self.log_file_level):
+                    return (yield)
+            else:
+                # Add a dummy handler to ensure logging.root.handlers is not empty.
+                # If it were empty, then a `logging.warning()` call (and similar) during collection
+                # would trigger a `logging.basicConfig()` call, which would add a `StreamHandler`
+                # handler, which would cause all subsequent logs which reach the root to be also
+                # printed to stdout, which we don't want (issue #6240).
+                with catching_logs(logging.NullHandler()):
+                    return (yield)
 
     @hookimpl(wrapper=True)
     def pytest_runtestloop(self, session: Session) -> Generator[None, object, object]:
@@ -818,7 +838,11 @@ class LoggingPlugin:
             item.stash[caplog_handler_key] = caplog_handler
 
             try:
-                yield
+                if self.log_file_handler is not None:
+                    with catching_logs(self.log_file_handler, level=self.log_file_level):
+                        yield
+                else:
+                    yield
             finally:
                 log = report_handler.stream.getvalue().strip()
                 item.add_report_section(when, "log", log)
@@ -856,7 +880,12 @@ class LoggingPlugin:
         self.log_cli_handler.set_when("sessionfinish")
 
         with catching_logs(self.log_cli_handler, level=self.log_cli_level):
-            with catching_logs(self.log_file_handler, level=self.log_file_level):
+            if self.log_file_handler is not None:
+                with catching_logs(
+                    self.log_file_handler, level=self.log_file_level
+                ):
+                    return (yield)
+            else:
                 return (yield)
 
     @hookimpl
