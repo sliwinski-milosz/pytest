@@ -5,6 +5,7 @@ import os
 import re
 from contextlib import contextmanager
 from contextlib import nullcontext
+from contextlib import ExitStack
 from datetime import datetime
 from datetime import timedelta
 from datetime import timezone
@@ -662,26 +663,36 @@ class LoggingPlugin:
         self.log_file_level = get_log_level_for_setting(
             config, "log_file_level", "log_level"
         )
-        log_file = get_option_ini(config, "log_file") or os.devnull
-        if log_file != os.devnull:
-            directory = os.path.dirname(os.path.abspath(log_file))
-            if not os.path.isdir(directory):
-                os.makedirs(directory)
 
-        self.log_file_handler = _FileHandler(log_file, mode="w", encoding="UTF-8")
-        log_file_format = get_option_ini(config, "log_file_format", "log_format")
-        log_file_date_format = get_option_ini(
+        self.log_file_format = get_option_ini(config, "log_file_format", "log_format")
+        self.log_file_date_format = get_option_ini(
             config, "log_file_date_format", "log_date_format"
         )
 
-        log_file_formatter = DatetimeFormatter(
-            log_file_format, datefmt=log_file_date_format
+        self.log_file_formatter = DatetimeFormatter(
+            self.log_file_format, datefmt=self.log_file_date_format
         )
-        self.log_file_handler.setFormatter(log_file_formatter)
+
+        log_file = get_option_ini(config, "log_file")
+        if log_file:
+            directory = os.path.dirname(os.path.abspath(log_file))
+            if not os.path.isdir(directory):
+                os.makedirs(directory)
+            self.log_file_handler = logging.FileHandler(
+                log_file, mode="w", encoding="UTF-8"
+            )  # type: Optional[logging.FileHandler]
+            self.log_file_handler.setFormatter(self.log_file_formatter)
+        else:
+            self.log_file_handler = None
 
         # CLI/live logging.
         self.log_cli_level = get_log_level_for_setting(
             config, "log_cli_level", "log_level"
+        )
+        log_cli_formatter = self._create_formatter(
+            get_option_ini(config, "log_cli_format", "log_format"),
+            get_option_ini(config, "log_cli_date_format", "log_date_format"),
+            get_option_ini(config, "log_auto_indent"),
         )
         if self._log_cli_enabled():
             terminal_reporter = config.pluginmanager.get_plugin("terminalreporter")
@@ -692,14 +703,10 @@ class LoggingPlugin:
             self.log_cli_handler: Union[
                 _LiveLoggingStreamHandler, _LiveLoggingNullHandler
             ] = _LiveLoggingStreamHandler(terminal_reporter, capture_manager)
+            self.log_cli_handler.setFormatter(log_cli_formatter)
         else:
-            self.log_cli_handler = _LiveLoggingNullHandler()
-        log_cli_formatter = self._create_formatter(
-            get_option_ini(config, "log_cli_format", "log_format"),
-            get_option_ini(config, "log_cli_date_format", "log_date_format"),
-            get_option_ini(config, "log_auto_indent"),
-        )
-        self.log_cli_handler.setFormatter(log_cli_formatter)
+            self.log_cli_handler = None
+        
         self._disable_loggers(loggers_to_disable=config.option.logger_disable)
 
     def _disable_loggers(self, loggers_to_disable: List[str]) -> None:
@@ -744,11 +751,13 @@ class LoggingPlugin:
         if not fpath.parent.exists():
             fpath.parent.mkdir(exist_ok=True, parents=True)
 
-        # https://github.com/python/mypy/issues/11193
-        stream: io.TextIOWrapper = fpath.open(mode="w", encoding="UTF-8")  # type: ignore[assignment]
-        old_stream = self.log_file_handler.setStream(stream)
-        if old_stream:
-            old_stream.close()
+        if self.log_file_handler is not None:
+            # https://github.com/python/mypy/issues/11193
+            stream: io.TextIOWrapper = fpath.open(mode="w", encoding="UTF-8")  # type: ignore[assignment]
+
+            old_stream = self.log_file_handler.setStream(stream)
+            if old_stream:
+                old_stream.close()
 
     def _log_cli_enabled(self) -> bool:
         """Return whether live logging is enabled."""
@@ -767,19 +776,34 @@ class LoggingPlugin:
 
     @hookimpl(wrapper=True, tryfirst=True)
     def pytest_sessionstart(self) -> Generator[None, None, None]:
-        self.log_cli_handler.set_when("sessionstart")
+        with ExitStack() as stack:
+            if self.log_cli_handler is not None:
+                self.log_cli_handler.set_when("sessionstart")
+                stack.enter_context(catching_logs(self.log_cli_handler, level=self.log_cli_level))
+            
+            if self.log_file_handler is not None:
+                stack.enter_context(catching_logs(self.log_file_handler, level=self.log_file_level))
 
-        with catching_logs(self.log_cli_handler, level=self.log_cli_level):
-            with catching_logs(self.log_file_handler, level=self.log_file_level):
-                return (yield)
+            return (yield)
 
     @hookimpl(wrapper=True, tryfirst=True)
     def pytest_collection(self) -> Generator[None, None, None]:
-        self.log_cli_handler.set_when("collection")
+        with ExitStack() as stack:
+            if self.log_cli_handler is not None:
+                self.log_cli_handler.set_when("collection")
+                stack.enter_context(catching_logs(self.log_cli_handler, level=self.log_cli_level))
+            
+            if self.log_file_handler is not None:
+                stack.enter_context(catching_logs(self.log_file_handler, level=self.log_file_level))
+            else:
+                # Add a dummy handler to ensure logging.root.handlers is not empty.
+                # If it were empty, then a `logging.warning()` call (and similar) during collection
+                # would trigger a `logging.basicConfig()` call, which would add a `StreamHandler`
+                # handler, which would cause all subsequent logs which reach the root to be also
+                # printed to stdout, which we don't want (issue #6240).
+                stack.enter_context(catching_logs(logging.NullHandler()))
 
-        with catching_logs(self.log_cli_handler, level=self.log_cli_level):
-            with catching_logs(self.log_file_handler, level=self.log_file_level):
-                return (yield)
+            return (yield)
 
     @hookimpl(wrapper=True)
     def pytest_runtestloop(self, session: Session) -> Generator[None, object, object]:
@@ -790,18 +814,32 @@ class LoggingPlugin:
             # The verbose flag is needed to avoid messy test progress output.
             self._config.option.verbose = 1
 
+        with ExitStack() as stack:
+            if self.log_cli_handler is not None:
+                stack.enter_context(catching_logs(self.log_cli_handler, level=self.log_cli_level))
+            
+            if self.log_file_handler is not None:
+                stack.enter_context(catching_logs(self.log_file_handler, level=self.log_file_level))
+
+            return (yield)
+
         with catching_logs(self.log_cli_handler, level=self.log_cli_level):
-            with catching_logs(self.log_file_handler, level=self.log_file_level):
-                return (yield)  # Run all the tests.
+            if self.log_file_handler is not None:
+                with catching_logs(self.log_file_handler, level=self.log_file_level):
+                    return (yield)  # Run all the tests.
+            else:
+                return (yield)
 
     @hookimpl
     def pytest_runtest_logstart(self) -> None:
-        self.log_cli_handler.reset()
-        self.log_cli_handler.set_when("start")
+        if self.log_cli_handler is not None:
+            self.log_cli_handler.reset()
+            self.log_cli_handler.set_when("start")
 
     @hookimpl
     def pytest_runtest_logreport(self) -> None:
-        self.log_cli_handler.set_when("logreport")
+        if self.log_cli_handler is not None:
+            self.log_cli_handler.set_when("logreport")
 
     def _runtest_for(self, item: nodes.Item, when: str) -> Generator[None, None, None]:
         """Implement the internals of the pytest_runtest_xxx() hooks."""
@@ -818,14 +856,19 @@ class LoggingPlugin:
             item.stash[caplog_handler_key] = caplog_handler
 
             try:
-                yield
+                if self.log_file_handler is not None:
+                    with catching_logs(self.log_file_handler, level=self.log_file_level):
+                        yield
+                else:
+                    yield
             finally:
                 log = report_handler.stream.getvalue().strip()
                 item.add_report_section(when, "log", log)
 
     @hookimpl(wrapper=True)
     def pytest_runtest_setup(self, item: nodes.Item) -> Generator[None, None, None]:
-        self.log_cli_handler.set_when("setup")
+        if self.log_cli_handler is not None:
+            self.log_cli_handler.set_when("setup")
 
         empty: Dict[str, List[logging.LogRecord]] = {}
         item.stash[caplog_records_key] = empty
@@ -833,13 +876,15 @@ class LoggingPlugin:
 
     @hookimpl(wrapper=True)
     def pytest_runtest_call(self, item: nodes.Item) -> Generator[None, None, None]:
-        self.log_cli_handler.set_when("call")
+        if self.log_cli_handler is not None:
+            self.log_cli_handler.set_when("call")
 
         yield from self._runtest_for(item, "call")
 
     @hookimpl(wrapper=True)
     def pytest_runtest_teardown(self, item: nodes.Item) -> Generator[None, None, None]:
-        self.log_cli_handler.set_when("teardown")
+        if self.log_cli_handler is not None:
+            self.log_cli_handler.set_when("teardown")
 
         try:
             yield from self._runtest_for(item, "teardown")
@@ -849,21 +894,27 @@ class LoggingPlugin:
 
     @hookimpl
     def pytest_runtest_logfinish(self) -> None:
-        self.log_cli_handler.set_when("finish")
+        if self.log_cli_handler is not None:
+            self.log_cli_handler.set_when("finish")
 
     @hookimpl(wrapper=True, tryfirst=True)
     def pytest_sessionfinish(self) -> Generator[None, None, None]:
-        self.log_cli_handler.set_when("sessionfinish")
+        with ExitStack() as stack:
+            if self.log_cli_handler is not None:
+                self.log_cli_handler.set_when("sessionfinish")
+                stack.enter_context(catching_logs(self.log_cli_handler, level=self.log_cli_level))
+            
+            if self.log_file_handler is not None:
+                stack.enter_context(catching_logs(self.log_file_handler, level=self.log_file_level))
 
-        with catching_logs(self.log_cli_handler, level=self.log_cli_level):
-            with catching_logs(self.log_file_handler, level=self.log_file_level):
-                return (yield)
+            return (yield)
 
     @hookimpl
     def pytest_unconfigure(self) -> None:
         # Close the FileHandler explicitly.
         # (logging.shutdown might have lost the weakref?!)
-        self.log_file_handler.close()
+        if self.log_file_handler is not None:
+            self.log_file_handler.close()
 
 
 class _FileHandler(logging.FileHandler):
