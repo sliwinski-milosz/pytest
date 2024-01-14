@@ -776,6 +776,9 @@ class LoggingPlugin:
 
     @hookimpl(wrapper=True, tryfirst=True)
     def pytest_sessionstart(self) -> Generator[None, None, None]:
+        if self.log_file_handler is None and self.log_file_handler is None:
+            return (yield)
+
         with ExitStack() as stack:
             if self.log_cli_handler is not None:
                 self.log_cli_handler.set_when("sessionstart")
@@ -814,6 +817,9 @@ class LoggingPlugin:
             # The verbose flag is needed to avoid messy test progress output.
             self._config.option.verbose = 1
 
+        if self.log_file_handler is None and self.log_file_handler is None:
+            return (yield)
+
         with ExitStack() as stack:
             if self.log_cli_handler is not None:
                 stack.enter_context(catching_logs(self.log_cli_handler, level=self.log_cli_level))
@@ -822,13 +828,6 @@ class LoggingPlugin:
                 stack.enter_context(catching_logs(self.log_file_handler, level=self.log_file_level))
 
             return (yield)
-
-        with catching_logs(self.log_cli_handler, level=self.log_cli_level):
-            if self.log_file_handler is not None:
-                with catching_logs(self.log_file_handler, level=self.log_file_level):
-                    return (yield)  # Run all the tests.
-            else:
-                return (yield)
 
     @hookimpl
     def pytest_runtest_logstart(self) -> None:
@@ -899,6 +898,9 @@ class LoggingPlugin:
 
     @hookimpl(wrapper=True, tryfirst=True)
     def pytest_sessionfinish(self) -> Generator[None, None, None]:
+        if self.log_file_handler is None and self.log_file_handler is None:
+            return (yield)
+        
         with ExitStack() as stack:
             if self.log_cli_handler is not None:
                 self.log_cli_handler.set_when("sessionfinish")
