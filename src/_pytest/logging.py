@@ -523,10 +523,10 @@ class LoggingPlugin:
         log_file_date_format = get_option_ini(
             config, "log_file_date_format", "log_date_format"
         )
-        log_file_formatter = logging.Formatter(
+        self.log_file_formatter = logging.Formatter(
             log_file_format, datefmt=log_file_date_format
         )
-        self.log_file_handler.setFormatter(log_file_formatter)
+        self.log_file_handler.setFormatter(self.log_file_formatter)
 
         # CLI/live logging.
         if self._log_cli_enabled():
@@ -593,19 +593,10 @@ class LoggingPlugin:
         if not fname.parent.exists():
             fname.parent.mkdir(exist_ok=True, parents=True)
 
-        stream = fname.open(mode="w", encoding="UTF-8")
-        if sys.version_info >= (3, 7):
-            old_stream = self.log_file_handler.setStream(stream)
-        else:
-            old_stream = self.log_file_handler.stream
-            self.log_file_handler.acquire()
-            try:
-                self.log_file_handler.flush()
-                self.log_file_handler.stream = stream
-            finally:
-                self.log_file_handler.release()
-        if old_stream:
-            old_stream.close()
+        self.log_file_handler = logging.FileHandler(
+            str(fname), mode="w", encoding="UTF-8"
+        )
+        self.log_file_handler.setFormatter(self.log_file_formatter)
 
     def _log_cli_enabled(self):
         """Return True if log_cli should be considered enabled, either explicitly
